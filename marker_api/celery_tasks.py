@@ -31,25 +31,29 @@ class PDFConversionTask(Task):
         return self.run(*args, **kwargs)
 
 
-@celery_app.task(
-    ignore_result=False, bind=True, base=PDFConversionTask, name="convert_pdf"
-)
+@celery_app.task(bind=True, name="convert_pdf")
 def convert_pdf_to_markdown(self, filename, pdf_content):
-    pdf_file = io.BytesIO(pdf_content)
-    markdown_text, images, metadata = convert_single_pdf(pdf_file, model_list)
-    image_data = {}
-    for i, (img_filename, image) in enumerate(images.items()):
-        logger.debug(f"Processing image {img_filename}")
-        image_base64 = process_image_to_base64(image, img_filename)
-        image_data[img_filename] = image_base64
+    logger.info(f"\n\nStarting conversion for {filename}")
+    try:
+        pdf_file = io.BytesIO(pdf_content)
+        markdown_text, images, metadata = convert_single_pdf(pdf_file, model_list)
+        image_data = {}
+        for img_filename, image in images.items():
+            logger.debug(f"\nProcessing image {img_filename}")
+            image_base64 = process_image_to_base64(image, img_filename)
+            image_data[img_filename] = image_base64
+        logger.info(f"Completed conversion for {filename}")
+        return {
+            "filename": filename,
+            "markdown": markdown_text,
+            "metadata": metadata,
+            "images": image_data,
+            "status": "ok",
+        }
+    except Exception as e:
+        logger.error(f"Error converting {filename}: {str(e)}", exc_info=True)
+        raise self.retry(exc=e, countdown=10, max_retries=3)
 
-    return {
-        "filename": filename,
-        "markdown": markdown_text,
-        "metadata": metadata,
-        "images": image_data,
-        "status": "ok",
-    }
 
 
 # @celery_app.task(

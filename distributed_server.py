@@ -1,7 +1,7 @@
 import argparse
 import uvicorn
 import logging
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File,Body
 from celery.exceptions import TimeoutError
 from fastapi.middleware.cors import CORSMiddleware
 from marker_api.celery_worker import celery_app
@@ -65,7 +65,7 @@ def is_celery_alive() -> bool:
     logger.debug("Checking if Celery is alive")
     try:
         result = celery_app.send_task("celery.ping")
-        result.get(timeout=3)
+        result.get(timeout=3600)
         logger.info("Celery is alive")
         return True
     except (TimeoutError, Exception) as e:
@@ -75,12 +75,13 @@ def is_celery_alive() -> bool:
 
 def setup_routes(app: FastAPI, celery_live: bool):
     logger.info("Setting up routes")
-    if celery_live:
+    if True:
         logger.info("Adding Celery routes")
 
         @app.post("/convert", response_model=ConversionResponse)
-        async def convert_pdf(pdf_file: UploadFile = File(...)):
-            return await celery_convert_pdf_concurrent_await(pdf_file)
+        async def convert_pdf(pdf_filename: str = Body(..., embed=True)):
+            print("pdf_filename : ", pdf_filename, flush=True)
+            return await celery_convert_pdf_concurrent_await(pdf_filename)
 
         @app.post("/celery/convert", response_model=CeleryTaskResponse)
         async def celery_convert(pdf_file: UploadFile = File(...)):
@@ -111,7 +112,7 @@ def parse_args():
         "--host", type=str, default="0.0.0.0", help="Host to run the FastAPI app"
     )
     parser.add_argument(
-        "--port", type=int, default=8080, help="Port to run the FastAPI app"
+        "--port", type=int, default=9090, help="Port to run the FastAPI app"
     )
     return parser.parse_args()
 

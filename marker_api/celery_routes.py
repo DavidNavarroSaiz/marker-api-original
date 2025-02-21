@@ -1,18 +1,18 @@
-from fastapi import UploadFile, File
+from fastapi import HTTPException, UploadFile, File, Body
 from celery.result import AsyncResult
 from fastapi.responses import JSONResponse
 from marker_api.celery_tasks import convert_pdf_to_markdown, process_batch
 import logging
 import asyncio
+import aiofiles
 from typing import List
 
 logger = logging.getLogger(__name__)
 
 
-async def celery_convert_pdf(pdf_file: UploadFile = File(...)):
-    contents = await pdf_file.read()
-    task_id = convert_pdf_to_markdown.delay(pdf_file.filename, contents)
-    return {"task_id": str(task_id), "status": "Processing"}
+async def convert_pdf(pdf_filename: str = Body(..., embed=True)):
+    print("\n\n processing new pdf_filename : ", pdf_filename, flush=True)
+    return await celery_convert_pdf_concurrent_await(pdf_filename)
 
 
 async def celery_result(task_id: str):
@@ -30,35 +30,93 @@ async def celery_offline_root():
 
 
 async def celery_convert_pdf_sync(pdf_file: UploadFile = File(...)):
+    logger.info(f"Starting synchronous PDF conversion for file: {pdf_file.filename}")
     contents = await pdf_file.read()
     task = convert_pdf_to_markdown.delay(pdf_file.filename, contents)
-    result = task.get(timeout=600)  # 10-minute timeout
+    result = task.get(timeout=3600)  # Increased to 10-minute timeout
+    logger.info(f"Completed synchronous conversion for file: {pdf_file.filename}")
     return {"status": "Success", "result": result}
 
 
-async def celery_convert_pdf_concurrent_await(pdf_file: UploadFile = File(...)):
-    contents = await pdf_file.read()
-
-    # Start the Celery task
-    task = convert_pdf_to_markdown.delay(pdf_file.filename, contents)
-
-    # Define an asynchronous function to check task status
-    async def check_task_status():
-        while True:
-            if task.ready():
-                return task.get()
-            await asyncio.sleep(1)  # Wait for 1 second before checking again
-
+async def celery_convert_pdf_concurrent_await(pdf_filename: str):
+    logger.info(f"Starting concurrent PDF conversion for file: {pdf_filename}")
     try:
-        # Wait for the task to complete with a timeout
-        result = await asyncio.wait_for(
-            check_task_status(), timeout=600
-        )  # 10-minute timeout
-        return {"status": "Success", "result": result}
-    except asyncio.TimeoutError:
+        # 1. Read PDF file
+        try:
+            async with aiofiles.open(pdf_filename, "rb") as pdf_file:
+                contents = await pdf_file.read()
+            logger.info(f"Successfully read PDF file {pdf_filename}. Size: {len(contents)} bytes")
+        except Exception as e:
+            logger.error(f"Error reading PDF file {pdf_filename}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=400, detail=f"Error reading PDF file: {str(e)}")
+
+        # 2. Start Celery task
+        try:
+            task = convert_pdf_to_markdown.delay(pdf_filename, contents)
+            logger.info(f"Celery task started for {pdf_filename}: {task.id}")
+        except Exception as e:
+            logger.error(f"Failed to start Celery task for {pdf_filename}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to start conversion task")
+
+        # 3. Check task status with better handling
+        async def check_task_status():
+            attempts = 0
+            max_attempts = 3600  # 10 minutes with 1-second intervals
+            
+            while attempts < max_attempts:
+                try:
+                    task_status = AsyncResult(task.id)
+                    
+                    if task_status.ready():
+                        if task_status.successful():
+                            logger.info(f"Task {task.id} completed successfully")
+                            return task_status.get()
+                        else:
+                            error = task_status.result
+                            logger.error(f"Task {task.id} failed: {error}")
+                            raise HTTPException(status_code=500, detail=f"Conversion failed: {str(error)}")
+                    
+                    # Log status every 30 seconds
+                    if attempts % 30 == 0:
+                        logger.info(f"Task {task.id} status after {attempts}s: {task_status.status}")
+                    
+                    attempts += 1
+                    await asyncio.sleep(1)
+                
+                except Exception as e:
+                    logger.error(f"Error checking task {task.id} status: {str(e)}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Error monitoring task: {str(e)}")
+            
+            logger.error(f"Task {task.id} exceeded maximum execution time of {max_attempts} seconds")
+            raise asyncio.TimeoutError("Task exceeded maximum execution time")
+
+        # 4. Wait for task completion with timeout
+        try:
+            result = await asyncio.wait_for(check_task_status(), timeout=3600)  # Increased to 10 minutes
+            logger.info(f"Task completed successfully for file: {pdf_filename}")
+            return {"status": "Success", "result": result}
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Task {task.id} timed out after 600 seconds")
+            task.revoke(terminate=True)
+            logger.error(f"Task {task.id} was terminated due to timeout")
+            return JSONResponse(
+                status_code=408,
+                content={
+                    "status": "Timeout",
+                    "message": "Task processing took too long",
+                    "task_id": task.id
+                }
+            )
+            
+    except Exception as e:
+        logger.error(f"Unexpected error processing {pdf_filename}: {str(e)}", exc_info=True)
         return JSONResponse(
-            status_code=408,
-            content={"status": "Timeout", "message": "Task processing took too long"},
+            status_code=500,
+            content={
+                "status": "Error",
+                "message": f"An unexpected error occurred: {str(e)}"
+            }
         )
 
 
